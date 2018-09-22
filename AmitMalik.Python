@@ -1,0 +1,68 @@
+from pyspark.sql import SparkSession
+from os.path import abspath
+import os, sys, csv, re, glob, subprocess, time, string,datetime
+import pyspark.sql.functions as fn
+
+# -------------------------Initiate Spark Session----------------------------
+
+warehouse_location = abspath('spark-warehouse')
+spark = SparkSession \
+        .builder \
+        .appName("Python Spark Hive") \
+        .config("spark.sql.warehouse.dir", warehouse_location) \
+        .enableHiveSupport() \
+        .getOrCreate()
+
+#reading data from Input_StartOfDay_Position.txt file 
+df_Position = spark.read.format('com.databricks.spark.csv')\
+                        .options(header='true', inferschema='true')\
+                        .load("Input_StartOfDay_Position.txt").cache()
+
+print('positation data read sucessfully')
+                        
+#creating spark view on Input_StartOfDay_Position.txt data
+df_Position.createOrReplaceTempView("df_Position_view")
+
+#reading data from Transactions.txt  Json file
+df_Transaction = spark.read.option("multiline", "True")\
+                           .json("Transactions.txt").cache()
+						   
+print('Transactions data read sucessfully')
+#aggregation of transaction data grouping on Instrument & TransactionType
+df_Transaction_sum=df_Transaction.select('Instrument','TransactionQuantity','TransactionType')\
+                             .groupby('Instrument','TransactionType')\
+                             .agg(fn.sum('TransactionQuantity').alias('TransactionQuantity'))
+print('Aggregation done on Transactions data')
+#creating spark view aggregated tansaction records
+df_Transaction_sum.createOrReplaceTempView("df_Transaction_sum_view")
+
+#calculating Quantity with Buy transaction 
+df_Position_B=spark.sql("""select A.Instrument,Account,AccountType,
+                           case when A.AccountType='E' THEN A.Quantity+nvl(B.TransactionQuantity,0) 
+                                when A.AccountType='I' THEN A.Quantity-nvl(B.TransactionQuantity,0) 
+                                else A.Quantity end  as Quantity  from 
+                         df_Position_view A left outer JOIN (select * from df_Transaction_sum_view where TransactionType='B') B 
+                         ON A.Instrument=B.Instrument  """)
+print('Calculation done on Buy transaction')                         
+#creating spark view on buy transaction                          
+df_Position_B.createOrReplaceTempView("df_Position_B_view")
+
+#calculating Quantity with Sell transaction 
+df_Position_S=spark.sql("""select A.Instrument,Account,AccountType,
+                           case when A.AccountType='E' THEN A.Quantity-nvl(B.TransactionQuantity,0) 
+                                when A.AccountType='I' THEN A.Quantity+nvl(B.TransactionQuantity,0) end  as Quantity  from 
+                         df_Position_B_view A left outer JOIN (select * from df_Transaction_sum_view where TransactionType='S') B 
+                         ON A.Instrument=B.Instrument """)
+print('Calculation done on SELL transaction')
+#creating spark view on sell transaction
+df_Position_S.createOrReplaceTempView("df_Position_S_view")                       
+
+#calculating delta
+df_Position_delta=spark.sql("""select A.Instrument,A.Account,A.AccountType,A.Quantity,(A.Quantity-B.Quantity) AS delta 
+                      from df_Position_S_view A left outer JOIN  df_Position_view B 
+                         ON A.Instrument=B.Instrument AND A.Account=B.Account """)
+print('Delta Calculation done')
+
+#creating expected output csv file
+df_Position_delta.write.format('com.databricks.spark.csv').options(header='true').save("expected_day_postion.csv")
+print('expected_day_postion.csv file created sucessfully')
